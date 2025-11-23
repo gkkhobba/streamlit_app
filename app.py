@@ -4,13 +4,25 @@ from dateutil import parser as dtparser
 from google.oauth2.service_account import Credentials
 import gspread
 from jinja2 import Template
-from weasyprint import HTML
 from io import BytesIO
 
-# ========== Streamlit setup ==========
+# --- Optional import: WeasyPrint (HTML->PDF). If missing, we fall back to ReportLab.
+HAS_WEASYPRINT = False
+try:
+    from weasyprint import HTML  # type: ignore
+    HAS_WEASYPRINT = True
+except Exception:
+    HAS_WEASYPRINT = False
+
+# Fallback PDF generator (compact A3) when WeasyPrint is unavailable
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A3
+from reportlab.lib.units import mm
+
+# ========= Streamlit setup =========
 st.set_page_config(page_title="Permission Cell — North-West", layout="wide")
 
-# ========== Config ==========
+# ========= Config =========
 SHEET_ID = st.secrets["sheet"]["id"]
 SHEET_NAME = st.secrets["sheet"]["name"]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -49,7 +61,7 @@ def load_df():
     rows = []
     for r in range(1, len(values)):
         row = values[r]
-        if not any(row):
+        if not any(row):  # skip entirely blank rows
             continue
         d = {k: (row[H[k]] if H[k] < len(row) else "") for k in H}
         d["_row"] = r+1
@@ -74,9 +86,11 @@ def _max_numeric(series: pd.Series) -> int:
     return best
 
 def generate_ids(df: pd.DataFrame, acno_raw: str|None):
+    # Application number is just next highest numeric
     app_next = _max_numeric(df.get("appno", pd.Series([], dtype=str))) + 1
     appno = str(app_next)
 
+    # Reference number  : <2-digit AC>AC<5-digit suffix starting after 39999>
     ac = "".join(ch for ch in str(acno_raw or "00") if ch.isdigit())
     prefix = (ac.zfill(2) if ac else "00") + "AC"
     suffix = 39999
@@ -84,7 +98,7 @@ def generate_ids(df: pd.DataFrame, acno_raw: str|None):
         if ref.startswith(prefix):
             tail = ref[len(prefix):]
             if tail.isdigit(): suffix = max(suffix, int(tail))
-    # ensure unique across sheet now
+    # Re-scan live sheet to avoid rare races
     ws, values, H, _ = _fetch_table()
     taken = {values[r][H["refno"]] for r in range(1, len(values)) if H["refno"] < len(values[r])}
     tries = 0
@@ -161,7 +175,7 @@ def pack_view(row: dict) -> dict:
         "orderdate": fmt_date(row.get("orderdate","")),
     }
 
-# ========== A3 HTML Template (Tailwind-like CSS cloned for PDF stability) ==========
+# ======= A3 HTML (for on-screen preview & WeasyPrint when available) =======
 HTML_TMPL = Template(r"""
 <!DOCTYPE html>
 <html>
@@ -172,9 +186,7 @@ HTML_TMPL = Template(r"""
 *{ box-sizing:border-box; }
 body{ font: 14pt/1.28 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", sans-serif; color:#0f172a; }
 .sheet{ position:relative; border:1px solid #d1d5db; border-radius:8px; padding:10mm 12mm; }
-.wm{
-  position:absolute; inset:0; margin:auto; width:42%; opacity:.07; filter:grayscale(100%); z-index:0;
-}
+.wm{ position:absolute; inset:0; margin:auto; width:42%; opacity:.07; filter:grayscale(100%); z-index:0; }
 .topband{ display:grid; grid-template-columns:90px 1fr 90px; gap:8px; align-items:center;
   border:2px solid #111; border-radius:8px; padding:8px 10px; background:#fff; position:relative; z-index:1; }
 .logo{ width:90px; height:90px; object-fit:contain; }
@@ -296,14 +308,82 @@ th,td{ border:1px solid #111; padding:6px 8px; vertical-align:middle; }
 def html_from_view(view: dict) -> str:
     return HTML_TMPL.render(view=view)
 
-def pdf_from_view(view: dict) -> bytes:
-    html = html_from_view(view)
+# Fallback ReportLab PDF (compact layout)
+def pdf_reportlab(view: dict) -> bytes:
     buf = BytesIO()
-    HTML(string=html, base_url=".").write_pdf(buf)
+    c = canvas.Canvas(buf, pagesize=A3)  # portrait
+    W, H = A3
+    x = 20*mm
+    y = H - 20*mm
+    line = 7*mm
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawCentredString(W/2, y, "PERMISSION CELL / SINGLE WINDOW — NORTH-WEST (KANJHAWALA)")
+    y -= 10*mm
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(x, y, f"Ref No.: {view.get('refno','')}"); y -= line
+    c.drawString(x, y, f"App No.: {view.get('appno','')}"); y -= line
+    c.drawString(x, y, f"Dated  : {view.get('dated','')}"); y -= (line+2*mm)
+
+    c.setFont("Helvetica-Bold", 13)
+    c.drawCentredString(W/2, y, "ORDER")
+    y -= (line + 4*mm)
+
+    c.setFont("Helvetica", 11)
+    def rowlbl(num, label, value):
+        nonlocal y
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(x, y, f"{num}. {label}")
+        c.setFont("Helvetica", 11)
+        c.drawString(x+190, y, f": {value}")
+        y -= line
+
+    rowlbl(1, "Ward & No. (AC/Ward)", f"{view.get('acname','')}  (AC-{view.get('acno','')}) (Ward-{view.get('wardno','')})")
+    rowlbl(2, "Election District", view.get("district",""))
+    rowlbl(3, "Organizer & Contact", f"{view.get('organizername','')} ({view.get('organizermobile','')})")
+    rowlbl(4, "Party & Designation", f"{view.get('party','')}, {view.get('designation','')}")
+    rowlbl(5, "Type of Programme", view.get("typeprog",""))
+    rowlbl(6, "Venue (PS)", f"{view.get('venueprog','')} ({view.get('psvenue','')})")
+    rowlbl(7, "Date", view.get("date",""))
+    rowlbl(8, "Time", view.get("time",""))
+    rowlbl(9, "Route/Distance", view.get("route",""))
+    rowlbl(10, "Permitted gathering", view.get("gathering",""))
+
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(x, y, "11. NOC obtained from"); y -= line
+    c.setFont("Helvetica", 11)
+    c.drawString(x+18, y, f"Local Police : {view.get('localpolice','')}"); y -= line
+    c.drawString(x+18, y, f"Traffic      : {view.get('traffic','')}"); y -= line
+    c.drawString(x+18, y, f"Land owning  : {view.get('landown','')}"); y -= line
+    c.drawString(x+18, y, f"Fire Deptt   : {view.get('fire','')}"); y -= (line + 2*mm)
+
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(x, y, "12. Permission / Reason"); y -= line
+    c.setFont("Helvetica", 11)
+    c.drawString(x+18, y, f"Permission : {view.get('permission','')}"); y -= line
+    c.drawString(x+18, y, f"Reason     : {view.get('reason','')}"); y -= (line + 2*mm)
+
+    c.setFont("Helvetica", 11)
+    c.drawString(x, 25*mm, f"No. {view.get('appno','')} /ACP(P)RO/PC-(NORTH-WEST)")
+    c.drawRightString(W - 20*mm, 25*mm, f"Dated : {view.get('dated','')}")
+
+    c.showPage()
+    c.save()
     buf.seek(0)
     return buf.read()
 
-# ========== UI State ==========
+def pdf_from_view(view: dict) -> bytes:
+    if HAS_WEASYPRINT:
+        html = html_from_view(view)
+        buf = BytesIO()
+        HTML(string=html, base_url=".").write_pdf(buf)  # type: ignore
+        buf.seek(0)
+        return buf.read()
+    # fallback
+    return pdf_reportlab(view)
+
+# ========= UI State =========
 if "offset" not in st.session_state: st.session_state.offset = 0
 if "filter" not in st.session_state: st.session_state.filter = ""
 if "selected" not in st.session_state: st.session_state.selected = None
@@ -311,7 +391,7 @@ PAGE = 60
 
 st.title("Permission Cell / Single Window — North-West")
 
-# Top actions
+# Top bar
 c1, c2, c3 = st.columns([0.45, 0.25, 0.30])
 with c1:
     ref_query = st.text_input("Search by Reference No.", placeholder="e.g. 28AC44838")
@@ -379,9 +459,15 @@ with right:
     if selected:
         view = pack_view(selected)
         html = html_from_view(view)
+        # Preview HTML in an iframe-like container
         st.components.v1.html(html, height=1150, scrolling=True)
+
         pdf_data = pdf_from_view(view)
-        st.download_button("Download A3 PDF", data=pdf_data, file_name=f"Order_{view['appno'] or 'NA'}.pdf", mime="application/pdf")
+        label = "Download A3 PDF (WeasyPrint)" if HAS_WEASYPRINT else "Download A3 PDF (fallback)"
+        st.download_button(label, data=pdf_data, file_name=f"Order_{view['appno'] or 'NA'}.pdf", mime="application/pdf")
+
+        # Also let users download the raw HTML (can print to PDF in browser)
+        st.download_button("Download A3 HTML", data=html.encode("utf-8"), file_name=f"Order_{view['appno'] or 'NA'}.html", mime="text/html")
 
     st.divider()
     st.subheader("Edit / Add")
@@ -441,13 +527,15 @@ with right:
             st.error("Ref No. and Application No. are required for update.")
             st.stop()
 
-        ref_unique, app_unique = check_unique(df, gen_ref or refno.strip(), gen_app or appno.strip(), row_idx)
+        ref_check = gen_ref or refno.strip()
+        app_check = gen_app or appno.strip()
+        ref_unique, app_unique = check_unique(df, ref_check, app_check, row_idx)
         if not ref_unique: st.error("Duplicate Reference No. — must be unique."); st.stop()
         if not app_unique: st.error("Duplicate Application No. — must be unique."); st.stop()
 
         payload = {
-            "refno": (gen_ref or refno).strip(),
-            "appno": (gen_app or appno).strip(),
+            "refno": ref_check,
+            "appno": app_check,
             "dated": dated.strip(),
             "acname": acname.strip(),
             "acno": acno.strip(),
@@ -484,7 +572,7 @@ with right:
                     new_row = add_row(payload)
                 st.success(f"Added as new (row {new_row}).")
 
-            # Refresh & re-select current
+            # Refresh & re-select
             st.cache_data.clear()
             df2 = load_df()
             match = df2.loc[df2["refno"] == payload["refno"]]
