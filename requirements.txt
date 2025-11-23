@@ -1,6 +1,9 @@
-streamlit>=1.30
-gspread>=6.0.0
-google-auth>=2.27.0
-pandas>=2.2.0
-reportlab>=4.0.8
+streamlit>=1.33
+gspread>=6.1.2
+google-auth>=2.33.0
+pandas>=2.2.2
 python-dateutil>=2.9.0
+jinja2>=3.1.4
+reportlab>=4.0.8
+# Optional (only for local servers where you can apt-get cairo/pango):
+# weasyprint>=62.3
