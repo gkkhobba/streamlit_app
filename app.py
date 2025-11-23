@@ -1,23 +1,20 @@
 import streamlit as st
 import pandas as pd
-from io import BytesIO
 from dateutil import parser as dtparser
 from google.oauth2.service_account import Credentials
 import gspread
-from gspread.utils import rowcol_to_a1
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A3
-from reportlab.lib.units import mm
+from jinja2 import Template
+from weasyprint import HTML
+from io import BytesIO
 
-# ===== Config =====
+# ========== Streamlit setup ==========
 st.set_page_config(page_title="Permission Cell — North-West", layout="wide")
 
+# ========== Config ==========
 SHEET_ID = st.secrets["sheet"]["id"]
 SHEET_NAME = st.secrets["sheet"]["name"]
-
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Expected headers (case/space/underscore-insensitive)
 NEED = [
     "refno","appno","dated","acname","acno","district","organizername","organizermobile",
     "party","designation","typeprog","venueprog","psvenue","date","time","route","gathering",
@@ -28,122 +25,106 @@ def _norm(s: str) -> str:
     return str(s or "").strip().lower().replace(" ", "").replace("_", "")
 
 @st.cache_resource(show_spinner=False)
-def _open_ws():
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=SCOPES
-    )
+def _ws():
+    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SHEET_ID)
     return sh.worksheet(SHEET_NAME)
 
 def _fetch_table():
-    """Return (values, head_map, col_count). values includes header row 0."""
-    ws = _open_ws()
+    ws = _ws()
     values = ws.get_all_values()
     if not values:
         raise RuntimeError("Empty sheet.")
     heads = values[0]
-    head_map = { _norm(h): i for i, h in enumerate(heads) }
-    # Validate headers
-    missing = [k for k in NEED if k not in head_map]
+    H = { _norm(h): i for i,h in enumerate(heads) }
+    missing = [k for k in NEED if k not in H]
     if missing:
         raise RuntimeError(f"Missing headers: {', '.join(missing)}")
-    return values, head_map, len(heads)
+    return ws, values, H, len(heads)
 
 @st.cache_data(show_spinner=False, ttl=20)
-def load_dataframe():
-    values, H, col_count = _fetch_table()
+def load_df():
+    ws, values, H, _ = _fetch_table()
     rows = []
     for r in range(1, len(values)):
         row = values[r]
         if not any(row):
             continue
-        d = {k: row[H[k]] if H[k] < len(row) else "" for k in H}
-        d["_row"] = r + 1
+        d = {k: (row[H[k]] if H[k] < len(row) else "") for k in H}
+        d["_row"] = r+1
         rows.append(d)
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 def check_unique(df: pd.DataFrame, refno: str, appno: str, exclude_row: int|None):
     ref_unique = True
     app_unique = True
     if refno:
-        ref_unique = not any((df["refno"].astype(str) == str(refno)) & (df["_row"] != exclude_row))
+        ref_unique = not any((df["refno"].astype(str)==str(refno)) & (df["_row"] != exclude_row))
     if appno:
-        app_unique = not any((df["appno"].astype(str) == str(appno)) & (df["_row"] != exclude_row))
+        app_unique = not any((df["appno"].astype(str)==str(appno)) & (df["_row"] != exclude_row))
     return ref_unique, app_unique
 
-def _max_numeric(text_series: pd.Series) -> int:
+def _max_numeric(series: pd.Series) -> int:
     best = 0
-    for v in text_series.dropna().astype(str):
-        n = "".join(ch for ch in v if ch.isdigit())
-        if n.isdigit():
-            best = max(best, int(n))
+    for v in series.dropna().astype(str):
+        digits = "".join(ch for ch in v if ch.isdigit())
+        if digits.isdigit():
+            best = max(best, int(digits))
     return best
 
-def generate_unique_ids(df: pd.DataFrame, acno_raw: str|None):
+def generate_ids(df: pd.DataFrame, acno_raw: str|None):
     app_next = _max_numeric(df.get("appno", pd.Series([], dtype=str))) + 1
     appno = str(app_next)
 
     ac = "".join(ch for ch in str(acno_raw or "00") if ch.isdigit())
     prefix = (ac.zfill(2) if ac else "00") + "AC"
-    # like GAS: start suffix at 39999 and grow
-    suffix_max = 39999
+    suffix = 39999
     for ref in df.get("refno", pd.Series([], dtype=str)).astype(str):
         if ref.startswith(prefix):
-            suf = ref[len(prefix):]
-            if suf.isdigit():
-                suffix_max = max(suffix_max, int(suf))
-    # find next unused
-    ws = _open_ws()
-    values = ws.get_all_values()
-    H = { _norm(h): i for i,h in enumerate(values[0]) }
-    taken = { str(values[r][H["refno"]]) for r in range(1, len(values)) if H["refno"] < len(values[r]) }
+            tail = ref[len(prefix):]
+            if tail.isdigit(): suffix = max(suffix, int(tail))
+    # ensure unique across sheet now
+    ws, values, H, _ = _fetch_table()
+    taken = {values[r][H["refno"]] for r in range(1, len(values)) if H["refno"] < len(values[r])}
     tries = 0
     while tries < 50:
-        suffix_max += 1
-        refno = f"{prefix}{str(suffix_max).zfill(5)}"
+        suffix += 1
+        refno = f"{prefix}{str(suffix).zfill(5)}"
         if refno not in taken:
             return refno, appno
         tries += 1
-    raise RuntimeError("Could not generate unique IDs after many tries.")
+    raise RuntimeError("ID generation failed after many tries.")
 
-def to_row_payload(head_map: dict, col_count: int, payload: dict):
-    out = [""] * col_count
+def to_row(H: dict, width: int, payload: dict):
+    out = [""] * width
     for k, v in payload.items():
         nk = _norm(k)
-        if nk in head_map:
-            out[head_map[nk]] = v
+        if nk in H:
+            out[H[nk]] = v
     return out
 
 def update_row(row_index: int, payload: dict):
-    ws = _open_ws()
-    values, H, col_count = _fetch_table()
-    out = to_row_payload(H, col_count, payload)
-    rng = f"{rowcol_to_a1(row_index,1)}:{rowcol_to_a1(row_index,col_count)}"
-    ws.update(rng, [out], value_input_option="USER_ENTERED")
+    ws, _, H, width = _fetch_table()
+    rng = gspread.utils.rowcol_to_a1(row_index,1) + ":" + gspread.utils.rowcol_to_a1(row_index, width)
+    ws.update(rng, [to_row(H, width, payload)], value_input_option="USER_ENTERED")
 
 def add_row(payload: dict) -> int:
-    ws = _open_ws()
-    values, H, col_count = _fetch_table()
-    out = to_row_payload(H, col_count, payload)
-    ws.append_row(out, value_input_option="USER_ENTERED")
-    # Re-fetch to get the new row index (safe & simple)
-    values2 = ws.get_all_values()
-    return len(values2)  # last row index
+    ws, _, H, width = _fetch_table()
+    ws.append_row(to_row(H, width, payload), value_input_option="USER_ENTERED")
+    return len(ws.get_all_values())
 
-def search_by_ref(ref: str) -> dict|None:
-    df = load_dataframe()
+def search_by_ref(ref: str):
+    df = load_df()
     needle = _norm(ref)
     for _, row in df.iterrows():
         if _norm(row["refno"]) == needle:
             return row.to_dict()
     return None
 
-def format_date_fallback(s: str, placeholder="______/_______/2025"):
+def fmt_date(s: str, placeholder="______/_______/2025"):
     s = (s or "").strip()
-    if not s:
-        return placeholder
+    if not s: return placeholder
     try:
         d = dtparser.parse(s, dayfirst=True, fuzzy=True)
         return d.strftime("%d/%m/%Y")
@@ -151,11 +132,10 @@ def format_date_fallback(s: str, placeholder="______/_______/2025"):
         return s
 
 def pack_view(row: dict) -> dict:
-    """Return dict for the order view."""
     return {
         "refno": row.get("refno",""),
         "appno": row.get("appno",""),
-        "dated": format_date_fallback(row.get("dated","")),
+        "dated": fmt_date(row.get("dated","")),
         "acname": row.get("acname",""),
         "acno": row.get("acno",""),
         "wardno": row.get("wardno",""),
@@ -167,7 +147,7 @@ def pack_view(row: dict) -> dict:
         "typeprog": row.get("typeprog",""),
         "venueprog": row.get("venueprog",""),
         "psvenue": row.get("psvenue",""),
-        "date": format_date_fallback(row.get("date","")),
+        "date": fmt_date(row.get("date","")),
         "time": row.get("time",""),
         "route": row.get("route",""),
         "gathering": row.get("gathering",""),
@@ -178,101 +158,175 @@ def pack_view(row: dict) -> dict:
         "permission": row.get("permission",""),
         "reason": row.get("reason",""),
         "orderno": row.get("orderno",""),
-        "orderdate": format_date_fallback(row.get("orderdate","")),
+        "orderdate": fmt_date(row.get("orderdate","")),
     }
 
-def pdf_bytes_from_view(view: dict) -> bytes:
-    """Very compact A3 PDF (portrait) with key fields."""
+# ========== A3 HTML Template (Tailwind-like CSS cloned for PDF stability) ==========
+HTML_TMPL = Template(r"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+@page { size: A3; margin: 10mm 12mm; }
+*{ box-sizing:border-box; }
+body{ font: 14pt/1.28 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", sans-serif; color:#0f172a; }
+.sheet{ position:relative; border:1px solid #d1d5db; border-radius:8px; padding:10mm 12mm; }
+.wm{
+  position:absolute; inset:0; margin:auto; width:42%; opacity:.07; filter:grayscale(100%); z-index:0;
+}
+.topband{ display:grid; grid-template-columns:90px 1fr 90px; gap:8px; align-items:center;
+  border:2px solid #111; border-radius:8px; padding:8px 10px; background:#fff; position:relative; z-index:1; }
+.logo{ width:90px; height:90px; object-fit:contain; }
+.t1{ font-weight:900; font-size:22pt; text-transform:uppercase; text-align:center; }
+.t2{ font-weight:800; font-size:16pt; text-transform:uppercase; text-align:center; }
+.t3{ font-weight:800; font-size:14pt; text-transform:uppercase; text-align:center; }
+.infostrip{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-top:8px; z-index:1; position:relative; }
+.infostrip > div{ border:1.4px solid #111; border-radius:6px; padding:6px 8px; font-weight:800; background:#fff; }
+.order-title{ text-align:center; font-weight:900; font-size:16pt; margin:8mm 0 5mm; text-transform:uppercase; }
+table{ width:100%; border-collapse:collapse; }
+th,td{ border:1px solid #111; padding:6px 8px; vertical-align:middle; }
+.idx{ width:6%; text-align:center; font-weight:900; }
+.lab{ width:47%; font-weight:800; }
+.val{ width:47%; font-weight:600; word-break:break-word; white-space:pre-wrap; }
+.grid2{ display:grid; grid-template-columns:1fr 1fr; gap:0px 18px; }
+.muted{ color:#6b7280; font-weight:600; }
+.signs{ display:grid; row-gap:18px; margin-top:12mm; }
+.sigL{ justify-self:start; }
+.sigR{ justify-self:end; }
+.sigbox{ display:inline-block; border-top:1px solid #000; padding-top:4px; text-transform:uppercase; font-weight:700; }
+.meta{ display:flex; justify-content:space-between; margin-top:6mm; font-weight:800; }
+.tc{ margin-top:7mm; }
+.tc .ttl{ font-weight:900; margin-bottom:4px; text-transform:uppercase; }
+.tc ol{ margin:0; padding-left:18px; }
+.tc li{ margin:2px 0; line-height:1.22; }
+.small{ font-size:12pt; }
+</style>
+</head>
+<body>
+  <div class="sheet">
+    <img class="wm" src="https://upload.wikimedia.org/wikipedia/commons/5/55/Emblem_of_India.svg" alt="">
+    <div class="topband">
+      <img class="logo" src="https://upload.wikimedia.org/wikipedia/commons/5/55/Emblem_of_India.svg" alt="">
+      <div>
+        <div class="t1">OFFICE OF THE INCHARGE</div>
+        <div class="t2">PERMISSION CELL / SINGLE WINDOW</div>
+        <div class="t2">DISTRICT ELECTION OFFICER : NORTH-WEST</div>
+        <div class="t3">KANJHAWALA DELHI - 110081</div>
+      </div>
+      <img class="logo" src="https://upload.wikimedia.org/wikipedia/commons/3/32/Swachh_Bharat_Mission_Logo.svg" alt="">
+    </div>
+
+    <div class="infostrip">
+      <div>Ref No. <b>{{ view.refno or "________" }}</b></div>
+      <div>Application No. <b>{{ view.appno or "——" }}</b></div>
+      <div>Dated : <b>{{ view.dated or "______/_______/2025" }}</b></div>
+    </div>
+
+    <div class="order-title">ORDER</div>
+
+    <table>
+      <tr><th class="idx">1.</th><th class="lab">Name of Municipal Corporation Ward &amp; No.</th>
+        <td class="val"><span>{{ view.acname }}</span> <span class="muted">(AC-{{ view.acno }})</span><span class="muted"> (Ward-{{ view.wardno }})</span></td></tr>
+      <tr><th class="idx">2.</th><th class="lab">Name of the Election District</th>
+        <td class="val">{{ view.district }}</td></tr>
+      <tr><th class="idx">3.</th><th class="lab">Name of the organizer &amp; Contact No</th>
+        <td class="val"><span>{{ view.organizername }}</span> ( <span>{{ view.organizermobile }}</span> )</td></tr>
+      <tr><th class="idx">4.</th><th class="lab">Party affiliation and his designation</th>
+        <td class="val"><span>{{ view.party }}</span>, <span>{{ view.designation }}</span></td></tr>
+      <tr><th class="idx">5.</th><th class="lab">Type of programme (meeting procession, rally, nukkad natak, pad yatra etc. with loudspeaker or without it)</th>
+        <td class="val">{{ view.typeprog }}</td></tr>
+      <tr><th class="idx">6.</th><th class="lab">Name of venue with police Station</th>
+        <td class="val"><span>{{ view.venueprog }}</span> ( <span>{{ view.psvenue }}</span> )</td></tr>
+      <tr><th class="idx">7.</th><th class="lab">Date</th>
+        <td class="val">{{ view.date or "______/_______/2025" }}</td></tr>
+      <tr><th class="idx">8.</th><th class="lab">Timing of Programme (Start and ending)</th>
+        <td class="val">{{ view.time }}</td></tr>
+      <tr><th class="idx">9.</th><th class="lab">Route and approximate distance to be covered (in case of pad yatra, procession etc.)</th>
+        <td class="val">{{ view.route }}</td></tr>
+      <tr><th class="idx">10.</th><th class="lab">Permitted gathering</th>
+        <td class="val">{{ view.gathering }}</td></tr>
+
+      <tr><th class="idx">11.</th><th class="lab">NOC obtained from</th>
+        <td class="val">
+          <div class="grid2 small">
+            <div>Local Police :- <b>{{ view.localpolice }}</b></div>
+            <div>Traffic Police:- <b>{{ view.traffic }}</b></div>
+            <div>Land owning agency:- <b>{{ view.landown }}</b></div>
+            <div>Fire Deptt:- <b>{{ view.fire }}</b></div>
+          </div>
+        </td>
+      </tr>
+
+      <tr><th class="idx">12.</th><th class="lab">Permission granted or not, if not the reason for not granting the permission</th>
+        <td class="val"><b>{{ view.permission }}</b><div class="muted">{{ view.reason }}</div></td></tr>
+    </table>
+
+    <div class="signs">
+      <div class="sigL"><div class="sigbox">INSPECTOR (PERMISSION CELL)</div></div>
+      <div class="sigR"><div class="sigbox">INCHARGE (PERMISSION CELL), NORTH-WEST (KANJHAWALA), DELHI</div></div>
+    </div>
+
+    <div class="meta">
+      <div>No. <b>{{ view.appno or "——" }}</b> /ACP(P)RO/PC-(NORTH-WEST)</div>
+      <div>Dated : <b>{{ view.dated or "______/_______/2025" }}</b></div>
+    </div>
+
+    <section class="tc">
+      <div class="ttl">TERMS &amp; CONDITIONS</div>
+      <ol>
+        <li>Instructions/guidelines issued by the Election Commission of India/State Election Commission in connection with Bye-Elections of MCD-2025 shall be complied with.</li>
+        <li>The date, time and place of the programme shall not be changed after issuing this permission.</li>
+        <li>Direction and advice of Police Officers on duty should be complied with to maintain law and order.</li>
+        <li>No effigies of opponents are allowed to be carried for burning.</li>
+        <li>Only 1/3 of the carriage way shall be used and the flow of traffic should remain smooth.</li>
+        <li>The organizer shall exercise control over carrying of such articles which may be misused by undesirable elements.</li>
+        <li>Pitch of the loudspeaker shall be controlled so that it is not audible beyond the audience.</li>
+        <li>The permission is not transferable.</li>
+        <li>The Model Code of Conduct regarding Bye-Elections of MCD-2025 will be complied with while organizing rallies, pad yatra etc.</li>
+        <li>As per ECI Guidelines, the temporary party office must be 200 meters away from any existing polling station.</li>
+        <li>The Permission is subject to Guidelines of Hon’ble Supreme Court / National Green Tribunal.</li>
+      </ol>
+    </section>
+  </div>
+</body>
+</html>
+""")
+
+def html_from_view(view: dict) -> str:
+    return HTML_TMPL.render(view=view)
+
+def pdf_from_view(view: dict) -> bytes:
+    html = html_from_view(view)
     buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A3)  # (841.89 x 1190.55) points portrait
-    W, H = A3
-    x = 20*mm
-    y = H - 20*mm
-    line = 7*mm
-
-    c.setFont("Helvetica-Bold", 16)
-    c.drawCentredString(W/2, y, "PERMISSION CELL / SINGLE WINDOW — NORTH-WEST (KANJHAWALA)")
-    y -= 10*mm
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(x, y, f"Ref No.: {view['refno']}"); y -= line
-    c.drawString(x, y, f"App No.: {view['appno']}"); y -= line
-    c.drawString(x, y, f"Dated  : {view['dated']}"); y -= (line+2*mm)
-
-    c.setFont("Helvetica-Bold", 13)
-    c.drawCentredString(W/2, y, "ORDER")
-    y -= (line + 4*mm)
-
-    c.setFont("Helvetica", 11)
-    def rowlbl(num, label, value):
-        nonlocal y
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(x, y, f"{num}. {label}")
-        c.setFont("Helvetica", 11)
-        c.drawString(x+190, y, f": {value}")
-        y -= line
-
-    rowlbl(1, "Ward & No. (AC/Ward)", f"{view['acname']}  (AC-{view['acno']}) (Ward-{view['wardno']})")
-    rowlbl(2, "Election District", view["district"])
-    rowlbl(3, "Organizer & Contact", f"{view['organizername']} ({view['organizermobile']})")
-    rowlbl(4, "Party & Designation", f"{view['party']}, {view['designation']}")
-    rowlbl(5, "Type of Programme", view["typeprog"])
-    rowlbl(6, "Venue (PS)", f"{view['venueprog']} ({view['psvenue']})")
-    rowlbl(7, "Date", view["date"])
-    rowlbl(8, "Time", view["time"])
-    rowlbl(9, "Route/Distance", view["route"])
-    rowlbl(10, "Permitted gathering", view["gathering"])
-
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(x, y, "11. NOC obtained from"); y -= line
-    c.setFont("Helvetica", 11)
-    c.drawString(x+18, y, f"Local Police : {view['localpolice']}"); y -= line
-    c.drawString(x+18, y, f"Traffic      : {view['traffic']}"); y -= line
-    c.drawString(x+18, y, f"Land owning  : {view['landown']}"); y -= line
-    c.drawString(x+18, y, f"Fire Deptt   : {view['fire']}"); y -= (line + 2*mm)
-
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(x, y, "12. Permission / Reason"); y -= line
-    c.setFont("Helvetica", 11)
-    c.drawString(x+18, y, f"Permission : {view['permission']}"); y -= line
-    c.drawString(x+18, y, f"Reason     : {view['reason']}"); y -= (line + 2*mm)
-
-    c.setFont("Helvetica", 11)
-    c.drawString(x, 25*mm, f"No. {view['appno']} /ACP(P)RO/PC-(NORTH-WEST)")
-    c.drawRightString(W - 20*mm, 25*mm, f"Dated : {view['dated']}")
-
-    c.showPage()
-    c.save()
+    HTML(string=html, base_url=".").write_pdf(buf)
     buf.seek(0)
     return buf.read()
 
-# ===== UI =====
+# ========== UI State ==========
 if "offset" not in st.session_state: st.session_state.offset = 0
-if "selected" not in st.session_state: st.session_state.selected = None
 if "filter" not in st.session_state: st.session_state.filter = ""
+if "selected" not in st.session_state: st.session_state.selected = None
 PAGE = 60
 
 st.title("Permission Cell / Single Window — North-West")
 
-# Top search & actions
-top_left, top_mid, top_right = st.columns([0.42, 0.28, 0.30])
-with top_left:
+# Top actions
+c1, c2, c3 = st.columns([0.45, 0.25, 0.30])
+with c1:
     ref_query = st.text_input("Search by Reference No.", placeholder="e.g. 28AC44838")
-with top_mid:
+with c2:
     if st.button("Search"):
         with st.spinner("Searching…"):
             hit = search_by_ref(ref_query)
-        if hit:
-            st.session_state.selected = hit
-            st.success("Loaded.")
-        else:
-            st.error("No record found.")
-with top_right:
+        if hit: st.session_state.selected = hit; st.success("Loaded.")
+        else: st.error("No record found.")
+with c3:
     new_click = st.button("New Entry", type="primary")
 
-df = load_dataframe()
+df = load_df()
 
-# ===== Left: List (descending appno) with Filter + Load more
+# Left list + Right details
 left, right = st.columns([0.36, 0.64], gap="small")
 
 with left:
@@ -296,12 +350,12 @@ with left:
         return int(s) if s.isdigit() else -10**9
 
     tmp = tmp.sort_values(by="appno", key=lambda s: s.map(_num), ascending=False).reset_index(drop=True)
+    show_df = tmp.iloc[0: st.session_state.offset + PAGE]
 
-    page_df = tmp.iloc[0: st.session_state.offset + PAGE]
-    for _, r in page_df.iterrows():
-        label = f"**{r['appno']}**  ·  {r.get('organizername','')[:24]}{'…' if len(str(r.get('organizername',''))) > 24 else ''}"
+    for _, r in show_df.iterrows():
+        lbl = f"**{r['appno']}**  ·  {r.get('organizername','')[:24]}{'…' if len(str(r.get('organizername',''))) > 24 else ''}"
         sub = f"{r.get('party','')}  ·  {r.get('typeprog','')}  ·  {r.get('refno','')}"
-        if st.button(label, key=f"pick_{r['appno']}"):
+        if st.button(lbl, key=f"pick_{r['appno']}"):
             st.session_state.selected = r.to_dict()
             st.toast(f"Loaded {r['appno']}")
         st.caption(sub)
@@ -315,52 +369,26 @@ with left:
         st.session_state.offset = 0
         st.rerun()
 
-# ===== Right: View + Form
 with right:
     if new_click:
-        st.session_state.selected = None  # clear -> new entry mode
+        st.session_state.selected = None
 
     selected = st.session_state.selected
+    st.subheader("A3 Order Preview")
 
-    st.subheader("Order Preview")
     if selected:
         view = pack_view(selected)
-        # Compact visual in Markdown (styled rows)
-        st.markdown(f"""
-**Ref No.**: {view['refno']} &nbsp;&nbsp; **App No.**: {view['appno']} &nbsp;&nbsp; **Dated**: {view['dated']}
+        html = html_from_view(view)
+        st.components.v1.html(html, height=1150, scrolling=True)
+        pdf_data = pdf_from_view(view)
+        st.download_button("Download A3 PDF", data=pdf_data, file_name=f"Order_{view['appno'] or 'NA'}.pdf", mime="application/pdf")
 
-**1. Ward & No. (AC/Ward):** {view['acname']}  (AC-{view['acno']}) (Ward-{view['wardno']})  
-**2. District:** {view['district']}  
-**3. Organizer & Contact:** {view['organizername']} ({view['organizermobile']})  
-**4. Party & Designation:** {view['party']}, {view['designation']}  
-**5. Type of Programme:** {view['typeprog']}  
-**6. Venue (PS):** {view['venueprog']} ({view['psvenue']})  
-**7. Date:** {view['date']}  
-**8. Time:** {view['time']}  
-**9. Route:** {view['route']}  
-**10. Permitted gathering:** {view['gathering']}
-
-**11. NOC obtained from**  
-• Local Police: {view['localpolice']}  
-• Traffic: {view['traffic']}  
-• Land owning: {view['landown']}  
-• Fire: {view['fire']}
-
-**12. Permission / Reason**  
-• Permission: {view['permission']}  
-• Reason: {view['reason']}
-
-_No. {view['appno']} /ACP(P)RO/PC-(NORTH-WEST) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Dated: {view['dated']}_
-        """)
-        pdf_data = pdf_bytes_from_view(view)
-        st.download_button("Download PDF", data=pdf_data, file_name=f"Order_{view['appno']}.pdf", mime="application/pdf")
-
-    # ===== Form (Edit / New)
     st.divider()
     st.subheader("Edit / Add")
-    with st.form(key="edit_form", clear_on_submit=False):
-        # When selected is None -> New Entry mode
+
+    with st.form("edit_form", clear_on_submit=False):
         col1, col2, col3 = st.columns(3)
+
         with col1:
             refno = st.text_input("Ref No.", value=(selected or {}).get("refno",""))
             acname = st.text_input("Ward / Area Name", value=(selected or {}).get("acname",""))
@@ -394,37 +422,32 @@ _No. {view['appno']} /ACP(P)RO/PC-(NORTH-WEST) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Da
             orderdate = st.text_input("Order Date (optional, DD-MM-YYYY)", value=(selected or {}).get("orderdate",""))
 
         submitted_update = st.form_submit_button("Update existing", use_container_width=True)
-        submitted_add = st.form_submit_button("Add as new", use_container_width=True, type="primary")
+        submitted_add = st.form_submit_button("Add as new (auto-generate allowed)", type="primary", use_container_width=True)
 
     if submitted_update or submitted_add:
         row_idx = (selected or {}).get("_row") if submitted_update else None
-        df = load_dataframe()
-        ref_unique, app_unique = check_unique(df, refno.strip(), appno.strip(), row_idx)
+        df = load_df()
 
-        # handle auto-generate for "Add new"
+        # Auto-generate if adding and blank
         gen_ref, gen_app = None, None
         if submitted_add and (not refno.strip() or not appno.strip()):
             try:
-                gen_ref, gen_app = generate_unique_ids(df, acno)
+                gen_ref, gen_app = generate_ids(df, acno)
             except Exception as e:
                 st.error(f"Auto-generate failed: {e}")
                 st.stop()
 
-        if not submitted_add:
-            if not refno.strip() or not appno.strip():
-                st.error("Ref No. and Application No. are required for update.")
-                st.stop()
+        if submitted_update and (not refno.strip() or not appno.strip()):
+            st.error("Ref No. and Application No. are required for update.")
+            st.stop()
 
-        if not ref_unique:
-            st.error("Duplicate Reference No. — must be unique.")
-            st.stop()
-        if not app_unique:
-            st.error("Duplicate Application No. — must be unique.")
-            st.stop()
+        ref_unique, app_unique = check_unique(df, gen_ref or refno.strip(), gen_app or appno.strip(), row_idx)
+        if not ref_unique: st.error("Duplicate Reference No. — must be unique."); st.stop()
+        if not app_unique: st.error("Duplicate Application No. — must be unique."); st.stop()
 
         payload = {
-            "refno": gen_ref or refno.strip(),
-            "appno": gen_app or appno.strip(),
+            "refno": (gen_ref or refno).strip(),
+            "appno": (gen_app or appno).strip(),
             "dated": dated.strip(),
             "acname": acname.strip(),
             "acno": acno.strip(),
@@ -456,18 +479,17 @@ _No. {view['appno']} /ACP(P)RO/PC-(NORTH-WEST) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Da
                 with st.spinner("Updating record…"):
                     update_row(int(row_idx), payload)
                 st.success("Updated.")
-                st.cache_data.clear()
-                df2 = load_dataframe()
-                match = df2.loc[df2["refno"] == payload["refno"]]
-                st.session_state.selected = match.iloc[0].to_dict() if not match.empty else None
-            elif submitted_add:
+            else:
                 with st.spinner("Adding new entry…"):
                     new_row = add_row(payload)
                 st.success(f"Added as new (row {new_row}).")
-                st.cache_data.clear()
-                df2 = load_dataframe()
-                match = df2.loc[df2["refno"] == payload["refno"]]
-                st.session_state.selected = match.iloc[0].to_dict() if not match.empty else None
-                st.session_state.offset = 0  # so newest shows on top
+
+            # Refresh & re-select current
+            st.cache_data.clear()
+            df2 = load_df()
+            match = df2.loc[df2["refno"] == payload["refno"]]
+            st.session_state.selected = match.iloc[0].to_dict() if not match.empty else None
+            st.session_state.offset = 0
+            st.rerun()
         except Exception as e:
             st.error(f"Operation failed: {e}")
