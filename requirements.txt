@@ -1,0 +1,6 @@
+streamlit>=1.30
+gspread>=6.0.0
+google-auth>=2.27.0
+pandas>=2.2.0
+reportlab>=4.0.8
+python-dateutil>=2.9.0
